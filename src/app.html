@@ -147,8 +147,8 @@
     <div class="hoop" id="hoop"></div>
     <div class="lbl">Thread order</div>
     <ol class="threads" id="threads"></ol>
-    <div class="name"><input id="fname" value="design" aria-label="File name"><span>.jef</span></div>
-    <div class="actions"><button class="btn save" id="save">Save .jef</button><button class="btn share" id="share">Share</button></div>
+    <div class="name"><input id="fname" value="design" aria-label="File name"><span>.JEF</span></div>
+    <div class="actions"><button class="btn save" id="save">Save .JEF</button><button class="btn share" id="share">Share</button></div>
     <p class="note">This is automatic digitizing. Check the preview, then test-stitch on scrap fabric with stabilizer before your garment.</p>
   </section>
 </div>
@@ -310,7 +310,7 @@
   }
 
   // ---------- save / share
-  const fileName = () => (($('fname').value || 'design').replace(/[^\w\- ]+/g, '').trim() || 'design') + '.jef';
+  const fileName = () => (($('fname').value || 'design').replace(/[^\w\- ]+/g, '').trim() || 'design') + '.JEF'; // upper case: many viewers and Janome machines only accept .JEF
   function b64(bytes) { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); }
 
   // Android app (Capacitor): call native plugins through the bridge
