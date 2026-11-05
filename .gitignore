@@ -1,0 +1,10 @@
+node_modules/
+test/ui_out/
+test/*.jef
+test/*.png
+!test/clipart.png
+android-app/www/
+android-app/android/app/build/
+android-app/android/build/
+android-app/android/.gradle/
+android-app/android/local.properties

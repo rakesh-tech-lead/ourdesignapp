@@ -1,0 +1,6 @@
+{
+  "appId": "com.jefmaker.app",
+  "appName": "JEF Maker",
+  "webDir": "www",
+  "android": { "allowMixedContent": false, "backgroundColor": "#f4eee4" }
+}

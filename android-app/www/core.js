@@ -1,0 +1,863 @@
+/* JEF Maker core: picture -> stitches -> Janome .jef
+ * Pure JavaScript, no dependencies. Runs in a browser (main thread or Web Worker)
+ * and in Node (for testing). All stitch geometry is in millimetres, y pointing down.
+ */
+(function (root) {
+  'use strict';
+
+  const JANOME = [[1,0x000000,"Black","002"],[2,0xffffff,"White","001"],[3,0xffff17,"Yellow","204"],[4,0xff6600,"Orange","203"],[5,0x2f5933,"Olive Green","219"],[6,0x237336,"Green","226"],[7,0x65c2c8,"Sky","217"],[8,0xab5a96,"Purple","208"],[9,0xf669a0,"Pink","201"],[10,0xff0000,"Red","225"],[11,0xb1704e,"Brown","214"],[12,0x0b2f84,"Blue","207"],[13,0xe4c35d,"Gold","003"],[14,0x481a05,"Dark Brown","205"],[15,0xac9cc7,"Pale Violet","209"],[16,0xfcf294,"Pale Yellow","210"],[17,0xf999b7,"Pale Pink","211"],[18,0xfab381,"Peach","212"],[19,0xc9a480,"Beige","213"],[20,0x970533,"Wine Red","215"],[21,0xa0b8cc,"Pale Sky","216"],[22,0x7fc21c,"Yellow Green","218"],[23,0xe5e5e5,"Silver Gray","220"],[24,0x889b9b,"Gray","221"],[25,0x98d6bd,"Pale Aqua","227"],[26,0xb2e1e3,"Baby Blue","228"],[27,0x368ba0,"Powder Blue","229"],[28,0x4f83ab,"Bright Blue","230"],[29,0x386a91,"Slate Blue","231"],[30,0x071650,"Navy Blue","232"],[31,0xf999a2,"Salmon Pink","233"],[32,0xf9676b,"Coral","234"],[33,0xe3311f,"Burnt Orange","235"],[34,0xe2a188,"Cinnamon","236"],[35,0xb59474,"Umber","237"],[36,0xe4cf99,"Blond","238"],[37,0xffcb00,"Sunflower","239"],[38,0xe1add4,"Orchid Pink","240"],[39,0xc3007e,"Peony Purple","241"],[40,0x80004b,"Burgundy","242"],[41,0x540571,"Royal Purple","243"],[42,0xb10525,"Cardinal Red","244"],[43,0xcae0c0,"Opal Green","245"],[44,0x899856,"Moss Green","246"],[45,0x5c941a,"Meadow Green","247"],[46,0x003114,"Dark Green","248"],[47,0x5dae94,"Aquamarine","249"],[48,0x4cbf8f,"Emerald Green","250"],[49,0x007772,"Peacock Green","251"],[50,0x595b61,"Dark Gray","252"],[51,0xfffff2,"Ivory White","253"],[52,0xb15818,"Hazel","254"],[53,0xcb8a07,"Toast","255"],[54,0x986c80,"Salmon","256"],[55,0x98692d,"Cocoa Brown","257"],[56,0x4d3419,"Sienna","258"],[57,0x4c330b,"Sepia","259"],[58,0x33200a,"Dark Sepia","260"],[59,0x523a97,"Violet Blue","261"],[60,0x0d217e,"Blue Ink","262"],[61,0x1e77ac,"Sola Blue","263"],[62,0xb2dd53,"Green Dust","264"],[63,0xf33689,"Crimson","265"],[64,0xde649e,"Floral Pink","266"],[65,0x984161,"Wine","267"],[66,0x4c5612,"Olive Drab","268"],[67,0x4c881f,"Meadow","269"],[68,0xe4de79,"Mustard","270"],[69,0xcb8a1a,"Yellow Ocher","271"],[70,0xcba21c,"Old Gold","272"],[71,0xff9805,"Honey Dew","273"],[72,0xfcb257,"Tangerine","274"],[73,0xffe505,"Canary Yellow","275"],[74,0xf0331f,"Vermilion","202"],[75,0x1a842d,"Bright Green","206"],[76,0x386cae,"Ocean Blue","222"],[77,0xe3c4b4,"Beige Gray","223"],[78,0xe3ac81,"Bamboo","224"]];
+
+
+  const PPM = 10;            // working pixels per millimetre
+  const MAX_STITCH = 6.5;    // longer stitches are split (mm)
+  const BIG = 1e20;
+
+  const DEFAULTS = {
+    widthMm: 100,        // finished width of the design
+    colors: 6,           // colours to detect, background included
+    stretchY: 1.0,       // > 1 undoes a photo taken at an angle
+    photo: false,        // true for phone photos of embroidery / fabric
+    keepBackground: false,
+    minAreaMm2: 1.2,     // specks smaller than this are merged away
+    thinMm: 1.3,         // thinner shapes become line (bean) stitches
+    satinMaxMm: 5.0,     // widest strip stitched as satin
+    splitMm: 2.2,        // stems narrower than this are split off wide shapes (0 = off)
+    fillSpacing: 0.42,   // tatami row spacing (mm)
+    fillAngle: null,     // fixed fill angle (deg); null = per shape
+    satinSpacing: 0.2,   // satin needle spacing along the shape (mm)
+    pullComp: 0.15,      // widen shapes so neighbours meet (mm)
+    autoTrim: true,      // width applies to the design, not to empty margins
+    janome: true         // snap colours to real Janome threads
+  };
+
+  // ------------------------------------------------------------------ colour
+  function srgbToLin(c) { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+  function linToSrgb(c) { c = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055; return Math.max(0, Math.min(255, Math.round(c * 255))); }
+  const LUT = new Float32Array(256); for (let i = 0; i < 256; i++) LUT[i] = srgbToLin(i);
+  function fLab(t) { return t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116; }
+  function rgbToLab(r, g, b, out, o) {
+    const R = r <= 255 && Number.isInteger(r) ? LUT[r] : srgbToLin(r), G = Number.isInteger(g) ? LUT[g] : srgbToLin(g), B = Number.isInteger(b) ? LUT[b] : srgbToLin(b);
+    const X = (R * 0.4124 + G * 0.3576 + B * 0.1805) / 0.95047;
+    const Y = (R * 0.2126 + G * 0.7152 + B * 0.0722);
+    const Z = (R * 0.0193 + G * 0.1192 + B * 0.9505) / 1.08883;
+    const fx = fLab(X), fy = fLab(Y), fz = fLab(Z);
+    out[o] = 116 * fy - 16; out[o + 1] = 500 * (fx - fy); out[o + 2] = 200 * (fy - fz);
+  }
+  function labToRgb(L, a, b) {
+    const fy = (L + 16) / 116, fx = fy + a / 500, fz = fy - b / 200;
+    const inv = t => (t * t * t > 0.008856 ? t * t * t : (t - 16 / 116) / 7.787);
+    const X = inv(fx) * 0.95047, Y = inv(fy), Z = inv(fz) * 1.08883;
+    return [linToSrgb(X * 3.2406 + Y * -1.5372 + Z * -0.4986), linToSrgb(X * -0.9689 + Y * 1.8758 + Z * 0.0415), linToSrgb(X * 0.0557 + Y * -0.2040 + Z * 1.0570)];
+  }
+
+  function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+  // ------------------------------------------------------------------ image ops
+  // image = {w, h, d: Float32Array rgb}
+  function fromRGBA(rgba, w, h) {
+    const d = new Float32Array(w * h * 3);
+    for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+      const a = rgba[j + 3] / 255;
+      d[i * 3] = rgba[j] * a + 255 * (1 - a); d[i * 3 + 1] = rgba[j + 1] * a + 255 * (1 - a); d[i * 3 + 2] = rgba[j + 2] * a + 255 * (1 - a);
+    }
+    return { w, h, d };
+  }
+
+  function crop(img, x0, y0, x1, y1) {
+    x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0));
+    x1 = Math.min(img.w, Math.ceil(x1)); y1 = Math.min(img.h, Math.ceil(y1));
+    const w = x1 - x0, h = y1 - y0, d = new Float32Array(w * h * 3);
+    for (let y = 0; y < h; y++) d.set(img.d.subarray(((y + y0) * img.w + x0) * 3, ((y + y0) * img.w + x1) * 3), y * w * 3);
+    return { w, h, d };
+  }
+
+  function resize1D(src, n, N, stride, count, getOff, setOff, out) {
+    // resample `count` lines of length n to length N (box filter down, linear up)
+    const s = n / N;
+    for (let c = 0; c < count; c++) {
+      for (let X = 0; X < N; X++) {
+        let r = 0, g = 0, b = 0;
+        if (s >= 1) {
+          const a0 = X * s, a1 = (X + 1) * s;
+          let wsum = 0;
+          for (let x = Math.floor(a0); x < Math.ceil(a1) && x < n; x++) {
+            const wgt = Math.min(x + 1, a1) - Math.max(x, a0);
+            if (wgt <= 0) continue;
+            const i = getOff(c, x); r += src[i] * wgt; g += src[i + 1] * wgt; b += src[i + 2] * wgt; wsum += wgt;
+          }
+          r /= wsum; g /= wsum; b /= wsum;
+        } else {
+          const fx = Math.max(0, Math.min(n - 1, (X + 0.5) * s - 0.5));
+          const x0 = Math.floor(fx), x1 = Math.min(n - 1, x0 + 1), t = fx - x0;
+          const i0 = getOff(c, x0), i1 = getOff(c, x1);
+          r = src[i0] * (1 - t) + src[i1] * t; g = src[i0 + 1] * (1 - t) + src[i1 + 1] * t; b = src[i0 + 2] * (1 - t) + src[i1 + 2] * t;
+        }
+        const o = setOff(c, X); out[o] = r; out[o + 1] = g; out[o + 2] = b;
+      }
+    }
+  }
+
+  function resize(img, W, H) {
+    const { w, h, d } = img;
+    const tmp = new Float32Array(W * h * 3);
+    resize1D(d, w, W, 3, h, (c, x) => (c * w + x) * 3, (c, X) => (c * W + X) * 3, tmp);
+    const out = new Float32Array(W * H * 3);
+    resize1D(tmp, h, H, 3, W, (c, y) => (y * W + c) * 3, (c, Y) => (Y * W + c) * 3, out);
+    return { w: W, h: H, d: out };
+  }
+
+  function blur(img, sigma) {
+    const r = Math.ceil(sigma * 2.5), k = [];
+    let s = 0; for (let i = -r; i <= r; i++) { const v = Math.exp(-i * i / (2 * sigma * sigma)); k.push(v); s += v; }
+    for (let i = 0; i < k.length; i++) k[i] /= s;
+    const { w, h, d } = img, t = new Float32Array(d.length), o = new Float32Array(d.length);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) for (let c = 0; c < 3; c++) {
+      let a = 0; for (let i = -r; i <= r; i++) { const xx = Math.min(w - 1, Math.max(0, x + i)); a += d[(y * w + xx) * 3 + c] * k[i + r]; }
+      t[(y * w + x) * 3 + c] = a;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) for (let c = 0; c < 3; c++) {
+      let a = 0; for (let i = -r; i <= r; i++) { const yy = Math.min(h - 1, Math.max(0, y + i)); a += t[(yy * w + x) * 3 + c] * k[i + r]; }
+      o[(y * w + x) * 3 + c] = a;
+    }
+    return { w, h, d: o };
+  }
+
+  // edge-preserving smoothing for photos (a few rounds of a bilateral-style filter)
+  function smoothPhoto(img) {
+    const { w, h } = img, R = 3, sc = 2 * 22 * 22, ss = 2 * 2.5 * 2.5;
+    const sw = []; for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) sw.push([dx, dy, Math.exp(-(dx * dx + dy * dy) / ss)]);
+    const LUTN = 4096, LSTEP = 3 * 255 * 255 / LUTN, cw = new Float32Array(LUTN + 1);
+    for (let i = 0; i <= LUTN; i++) cw[i] = Math.exp(-(i * LSTEP) / sc);
+    let cur = img.d;
+    for (let pass = 0; pass < 2; pass++) {
+      const out = new Float32Array(cur.length);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const i0 = (y * w + x) * 3, r0 = cur[i0], g0 = cur[i0 + 1], b0 = cur[i0 + 2];
+        let r = 0, g = 0, b = 0, ws = 0;
+        for (let s = 0; s < sw.length; s++) {
+          const xx = x + sw[s][0], yy = y + sw[s][1]; if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+          const i = (yy * w + xx) * 3, dr = cur[i] - r0, dg = cur[i + 1] - g0, db = cur[i + 2] - b0;
+          const wgt = sw[s][2] * cw[Math.min(LUTN, ((dr * dr + dg * dg + db * db) / LSTEP) | 0)];
+          r += cur[i] * wgt; g += cur[i + 1] * wgt; b += cur[i + 2] * wgt; ws += wgt;
+        }
+        out[i0] = r / ws; out[i0 + 1] = g / ws; out[i0 + 2] = b / ws;
+      }
+      cur = out;
+    }
+    return { w, h, d: cur };
+  }
+
+  function toLab(img) {
+    const n = img.w * img.h, lab = new Float32Array(n * 3), d = img.d;
+    for (let i = 0; i < n; i++) rgbToLab(Math.round(d[i * 3]), Math.round(d[i * 3 + 1]), Math.round(d[i * 3 + 2]), lab, i * 3);
+    return lab;
+  }
+
+  // ------------------------------------------------------------------ colour clusters
+  function kmeans(lab, n, k, seed) {
+    const rand = rng(seed || 1);
+    const m = Math.min(n, 40000), S = new Float32Array(m * 3);
+    for (let i = 0; i < m; i++) { const j = Math.floor(rand() * n); S[i * 3] = lab[j * 3]; S[i * 3 + 1] = lab[j * 3 + 1]; S[i * 3 + 2] = lab[j * 3 + 2]; }
+    const C = new Float32Array(k * 3), dmin = new Float32Array(m).fill(BIG);
+    let first = Math.floor(rand() * m); C.set(S.subarray(first * 3, first * 3 + 3), 0);
+    for (let c = 1; c < k; c++) {           // k-means++ seeding
+      let sum = 0;
+      for (let i = 0; i < m; i++) {
+        const dx = S[i * 3] - C[(c - 1) * 3], dy = S[i * 3 + 1] - C[(c - 1) * 3 + 1], dz = S[i * 3 + 2] - C[(c - 1) * 3 + 2];
+        const d = dx * dx + dy * dy + dz * dz; if (d < dmin[i]) dmin[i] = d; sum += dmin[i];
+      }
+      let r = rand() * sum, pick = 0;
+      for (let i = 0; i < m; i++) { r -= dmin[i]; if (r <= 0) { pick = i; break; } }
+      C.set(S.subarray(pick * 3, pick * 3 + 3), c * 3);
+    }
+    const lbl = new Int32Array(m);
+    for (let it = 0; it < 30; it++) {
+      const acc = new Float64Array(k * 4);
+      for (let i = 0; i < m; i++) {
+        let best = 0, bd = BIG;
+        for (let c = 0; c < k; c++) { const dx = S[i * 3] - C[c * 3], dy = S[i * 3 + 1] - C[c * 3 + 1], dz = S[i * 3 + 2] - C[c * 3 + 2]; const d = dx * dx + dy * dy + dz * dz; if (d < bd) { bd = d; best = c; } }
+        lbl[i] = best; acc[best * 4] += S[i * 3]; acc[best * 4 + 1] += S[i * 3 + 1]; acc[best * 4 + 2] += S[i * 3 + 2]; acc[best * 4 + 3]++;
+      }
+      let moved = 0;
+      for (let c = 0; c < k; c++) if (acc[c * 4 + 3] > 0) {
+        for (let j = 0; j < 3; j++) { const v = acc[c * 4 + j] / acc[c * 4 + 3]; moved += Math.abs(v - C[c * 3 + j]); C[c * 3 + j] = v; }
+      }
+      if (moved < 0.05) break;
+    }
+    const labels = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      let best = 0, bd = BIG;
+      for (let c = 0; c < k; c++) { const dx = lab[i * 3] - C[c * 3], dy = lab[i * 3 + 1] - C[c * 3 + 1], dz = lab[i * 3 + 2] - C[c * 3 + 2]; const d = dx * dx + dy * dy + dz * dz; if (d < bd) { bd = d; best = c; } }
+      labels[i] = best;
+    }
+    return { labels, centers: C };
+  }
+
+  function integral(mask, w, h) {
+    const I = new Int32Array((w + 1) * (h + 1));
+    for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += mask[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; } }
+    return I;
+  }
+  function boxSum(I, w, h, x, y, r) {
+    const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(w, x + r + 1), y1 = Math.min(h, y + r + 1), W = w + 1;
+    return I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0];
+  }
+
+  function majority(labels, w, h, k, r, iters) {
+    let L = labels;
+    for (let it = 0; it < iters; it++) {
+      const ints = [];
+      for (let c = 0; c < k; c++) { const m = new Uint8Array(w * h); for (let i = 0; i < w * h; i++) m[i] = L[i] === c ? 1 : 0; ints.push(integral(m, w, h)); }
+      const out = new Uint8Array(w * h);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let best = L[y * w + x], bv = -1;
+        for (let c = 0; c < k; c++) { const v = boxSum(ints[c], w, h, x, y, r); if (v > bv) { bv = v; best = c; } }
+        out[y * w + x] = best;
+      }
+      L = out;
+    }
+    return L;
+  }
+
+  function backgroundLabel(labels, w, h, k) {
+    const cnt = new Int32Array(k);
+    for (let x = 0; x < w; x++) { cnt[labels[x]]++; cnt[labels[(h - 1) * w + x]]++; }
+    for (let y = 0; y < h; y++) { cnt[labels[y * w]]++; cnt[labels[y * w + w - 1]]++; }
+    let b = 0; for (let c = 1; c < k; c++) if (cnt[c] > cnt[b]) b = c;
+    return b;
+  }
+
+  const N8 = [[-1, -1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]];
+
+  // merge tiny same-colour islands into whatever surrounds them
+  function cleanSpecks(labels, w, h, k, minPx) {
+    const seen = new Uint8Array(w * h), stack = new Int32Array(w * h), nb = new Int32Array(k);
+    for (let s = 0; s < w * h; s++) {
+      if (seen[s]) continue;
+      const c = labels[s]; let top = 0, n = 0; stack[top++] = s; seen[s] = 1;
+      const pix = [];
+      while (top) {
+        const p = stack[--top]; n++; if (pix.length <= minPx) pix.push(p);
+        const x = p % w, y = (p - x) / w;
+        for (const [dx, dy] of N8) {
+          const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+          const q = yy * w + xx; if (!seen[q] && labels[q] === c) { seen[q] = 1; stack[top++] = q; }
+        }
+      }
+      if (n < minPx) {
+        nb.fill(0);
+        for (const p of pix) {
+          const x = p % w, y = (p - x) / w;
+          for (const [dx, dy] of N8) { const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue; const l = labels[yy * w + xx]; if (l !== c) nb[l]++; }
+        }
+        let best = -1, bv = 0; for (let j = 0; j < k; j++) if (nb[j] > bv) { bv = nb[j]; best = j; }
+        if (best >= 0) for (const p of pix) labels[p] = best;
+      }
+    }
+    return labels;
+  }
+
+  function representativeColors(lab, labels, w, h, k) {
+    const out = [];
+    for (let c = 0; c < k; c++) {
+      const m = new Uint8Array(w * h); for (let i = 0; i < w * h; i++) m[i] = labels[i] === c ? 1 : 0;
+      const I = integral(m, w, h);
+      let rad = 2, pts = [];
+      for (; rad >= 0; rad--) {
+        pts = []; const need = (2 * rad + 1) * (2 * rad + 1);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (m[y * w + x] && boxSum(I, w, h, x, y, rad) === need) pts.push(y * w + x);
+        if (pts.length >= 30 || rad === 0) break;
+      }
+      if (!pts.length) { out.push([128, 128, 128]); continue; }
+      const step = Math.max(1, Math.floor(pts.length / 20000)), sel = [];
+      for (let i = 0; i < pts.length; i += step) sel.push(pts[i]);
+      const chroma = sel.map(p => Math.hypot(lab[p * 3 + 1], lab[p * 3 + 2]));
+      const sorted = chroma.slice().sort((a, b) => a - b), cut = sorted[Math.floor(sorted.length * 0.7)];
+      const L = [], A = [], B = [];
+      sel.forEach((p, i) => { if (chroma[i] >= cut) { L.push(lab[p * 3]); A.push(lab[p * 3 + 1]); B.push(lab[p * 3 + 2]); } });
+      const med = a => { a.sort((x, y) => x - y); return a[Math.floor(a.length / 2)]; };
+      out.push(labToRgb(med(L), med(A), med(B)));
+    }
+    return out;
+  }
+
+  function snapToJanome(rgbs, photo, tune) {
+    const chromaBoost = tune ? tune[0] : 1.0, wL = tune ? tune[1] : 1.0;
+    const jl = JANOME.map(t => { const o = new Float32Array(3); rgbToLab((t[1] >> 16) & 255, (t[1] >> 8) & 255, t[1] & 255, o, 0); return o; });
+    const D = rgbs.map(c => {
+      const o = new Float32Array(3); rgbToLab(c[0], c[1], c[2], o, 0); o[1] *= chromaBoost; o[2] *= chromaBoost;
+      return jl.map(j => Math.pow((o[0] - j[0]) * wL, 2) + Math.pow(o[1] - j[1], 2) + Math.pow(o[2] - j[2], 2));
+    });
+    const order = rgbs.map((_, i) => i).sort((a, b) => Math.min(...D[a]) - Math.min(...D[b]));
+    const taken = new Set(), res = new Array(rgbs.length);
+    for (const i of order) {
+      const idx = D[i].map((v, j) => j).sort((a, b) => D[i][a] - D[i][b]);
+      for (const j of idx) if (!taken.has(j)) { taken.add(j); res[i] = JANOME[j]; break; }
+    }
+    return res.map(t => ({ index: t[0], rgb: [(t[1] >> 16) & 255, (t[1] >> 8) & 255, t[1] & 255], name: t[2] + ' ' + t[3] }));
+  }
+
+  // ------------------------------------------------------------------ shape analysis
+  function edt1d(f, n, d, v, z) {
+    let k = 0; v[0] = 0; z[0] = -BIG; z[1] = BIG;
+    for (let q = 1; q < n; q++) {
+      let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+      k++; v[k] = q; z[k] = s; z[k + 1] = BIG;
+    }
+    k = 0;
+    for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]; }
+  }
+  // squared distance from every pixel to the nearest pixel where `isSource` is true
+  function edt(w, h, isSource) {
+    const D = new Float64Array(w * h), n = Math.max(w, h);
+    const f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+    for (let i = 0; i < w * h; i++) D[i] = isSource(i) ? 0 : BIG;
+    for (let x = 0; x < w; x++) { for (let y = 0; y < h; y++) f[y] = D[y * w + x]; edt1d(f, h, d, v, z); for (let y = 0; y < h; y++) D[y * w + x] = d[y]; }
+    for (let y = 0; y < h; y++) { for (let x = 0; x < w; x++) f[x] = D[y * w + x]; edt1d(f, w, d, v, z); for (let x = 0; x < w; x++) D[y * w + x] = d[x]; }
+    return D;
+  }
+
+  function components(mask, w, h, minPx) {
+    const seen = new Uint8Array(w * h), stack = new Int32Array(w * h), out = [];
+    for (let s = 0; s < w * h; s++) {
+      if (!mask[s] || seen[s]) continue;
+      let top = 0; stack[top++] = s; seen[s] = 1; const pix = []; let x0 = w, y0 = h, x1 = 0, y1 = 0;
+      while (top) {
+        const p = stack[--top]; pix.push(p);
+        const x = p % w, y = (p - x) / w;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        for (const [dx, dy] of N8) { const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue; const q = yy * w + xx; if (mask[q] && !seen[q]) { seen[q] = 1; stack[top++] = q; } }
+      }
+      if (pix.length >= minPx) out.push({ pix, x0, y0, x1, y1 });
+    }
+    return out;
+  }
+
+  // local mask (with 2px empty border) for a pixel list
+  function localMask(comp, W) {
+    const pad = 2, ox = comp.x0 - pad, oy = comp.y0 - pad, w = comp.x1 - comp.x0 + 1 + 2 * pad, h = comp.y1 - comp.y0 + 1 + 2 * pad;
+    const m = new Uint8Array(w * h);
+    for (const p of comp.pix) { const x = p % W, y = (p - x) / W; m[(y - oy) * w + (x - ox)] = 1; }
+    return { m, w, h, ox, oy };
+  }
+
+  function thin(mask, w, h) { // Zhang-Suen
+    const m = Uint8Array.from(mask); let changed = true;
+    const P = (x, y) => m[y * w + x];
+    while (changed) {
+      changed = false;
+      for (let step = 0; step < 2; step++) {
+        const del = [];
+        for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+          if (!P(x, y)) continue;
+          const p2 = P(x, y - 1), p3 = P(x + 1, y - 1), p4 = P(x + 1, y), p5 = P(x + 1, y + 1), p6 = P(x, y + 1), p7 = P(x - 1, y + 1), p8 = P(x - 1, y), p9 = P(x - 1, y - 1);
+          const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9; if (B < 2 || B > 6) continue;
+          const seq = [p2, p3, p4, p5, p6, p7, p8, p9, p2]; let A = 0; for (let i = 0; i < 8; i++) if (!seq[i] && seq[i + 1]) A++;
+          if (A !== 1) continue;
+          if (step === 0 ? (p2 * p4 * p6 === 0 && p4 * p6 * p8 === 0) : (p2 * p4 * p8 === 0 && p2 * p6 * p8 === 0)) del.push(y * w + x);
+        }
+        if (del.length) { changed = true; for (const i of del) m[i] = 0; }
+      }
+    }
+    return m;
+  }
+
+  function skelNeighbors(sk, w, h, p) {
+    const x = p % w, y = (p - x) / w, r = [];
+    for (const [dx, dy] of N8) { const xx = x + dx, yy = y + dy; if (xx >= 0 && yy >= 0 && xx < w && yy < h && sk[yy * w + xx]) r.push(yy * w + xx); }
+    return r;
+  }
+
+  function skeletonPaths(sk, w, h, minLen) {
+    const pix = []; for (let i = 0; i < w * h; i++) if (sk[i]) pix.push(i);
+    const deg = new Map(); for (const p of pix) deg.set(p, skelNeighbors(sk, w, h, p).length);
+    const nodes = new Set(pix.filter(p => deg.get(p) !== 2));
+    const seen = new Set(), key = (a, b) => a < b ? a * 1e7 + b : b * 1e7 + a, paths = [];
+    const walk = (a, b) => {
+      const path = [a, b]; seen.add(key(a, b)); let prev = a, cur = b;
+      while (!nodes.has(cur)) {
+        const nx = skelNeighbors(sk, w, h, cur).filter(q => q !== prev && !seen.has(key(cur, q)));
+        if (!nx.length) break;
+        seen.add(key(cur, nx[0])); prev = cur; cur = nx[0]; path.push(cur);
+      }
+      return path;
+    };
+    for (const n of nodes) for (const m of skelNeighbors(sk, w, h, n)) if (!seen.has(key(n, m))) paths.push(walk(n, m));
+    for (const p of pix) if (!nodes.has(p) && !skelNeighbors(sk, w, h, p).some(q => seen.has(key(p, q)))) {
+      const q = skelNeighbors(sk, w, h, p)[0]; if (q === undefined) continue;
+      nodes.add(p); paths.push(walk(p, q)); nodes.delete(p);
+    }
+    return paths.filter(pth => pth.length >= minLen).map(pth => pth.map(p => { const x = p % w; return [x + 0.5, (p - x) / w + 0.5]; }));
+  }
+
+  function longestPath(sk, w, h) {
+    let start = -1, count = 0; for (let i = 0; i < w * h; i++) if (sk[i]) { if (start < 0) start = i; count++; }
+    if (count < 3) return null;
+    const bfs = s => {
+      const par = new Map([[s, -1]]), q = [s]; let last = s;
+      for (let i = 0; i < q.length; i++) { const c = q[i]; last = c; for (const n of skelNeighbors(sk, w, h, c)) if (!par.has(n)) { par.set(n, c); q.push(n); } }
+      return [last, par];
+    };
+    const [a] = bfs(start), [b, par] = bfs(a), path = [];
+    for (let c = b; c !== -1; c = par.get(c)) { const x = c % w; path.push([x + 0.5, (c - x) / w + 0.5]); }
+    return { path, count };
+  }
+
+  function smoothPath(pts, win) {
+    if (pts.length < win + 2) return pts;
+    const r = Math.floor(win / 2), out = [];
+    for (let i = 0; i < pts.length; i++) {
+      let sx = 0, sy = 0;
+      for (let j = -r; j <= r; j++) { const q = pts[Math.min(pts.length - 1, Math.max(0, i + j))]; sx += q[0]; sy += q[1]; }
+      out.push([sx / win, sy / win]);
+    }
+    return out;
+  }
+
+  function principalAngle(m, w, h) {
+    let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (m[y * w + x]) { n++; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; }
+    if (n < 3) return 0;
+    const cx = sx / n, cy = sy / n, a = sxx / n - cx * cx, b = sxy / n - cx * cy, c = syy / n - cy * cy;
+    return 0.5 * Math.atan2(2 * b, a - c) * 180 / Math.PI;
+  }
+
+  // ------------------------------------------------------------------ stitch helpers (mm)
+  function resample(pts, step) {
+    if (pts.length < 2) return pts.slice();
+    const L = [0]; for (let i = 1; i < pts.length; i++) L.push(L[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+    const total = L[L.length - 1], n = Math.max(1, Math.ceil(total / step)), out = [];
+    let j = 0;
+    for (let i = 0; i <= n; i++) {
+      const s = total * i / n; while (j < L.length - 2 && L[j + 1] < s) j++;
+      const seg = L[j + 1] - L[j] || 1, t = (s - L[j]) / seg;
+      out.push([pts[j][0] + (pts[j + 1][0] - pts[j][0]) * t, pts[j][1] + (pts[j + 1][1] - pts[j][1]) * t]);
+    }
+    return out;
+  }
+  const run = (pts, step) => resample(pts, step || 2.0);
+  function bean(pts, step) {
+    const r = resample(pts, step || 1.5), out = [r[0]];
+    for (let i = 1; i < r.length; i++) out.push(r[i], r[i - 1], r[i]);
+    return out;
+  }
+  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+  // satin across a raster shape, guided by its spine (all in local px)
+  function satinRaster(m, w, h, spine, opt) {
+    const inside = (x, y) => { const xi = Math.floor(x), yi = Math.floor(y); return xi >= 0 && yi >= 0 && xi < w && yi < h && m[yi * w + xi] === 1; };
+    let g = spine;
+    const a0 = g[0], a1 = g[Math.min(3, g.length - 1)], b0 = g[g.length - 1], b1 = g[Math.max(0, g.length - 4)];
+    const n0 = dist(a0, a1) || 1, n1 = dist(b0, b1) || 1;
+    g = [[a0[0] + (a0[0] - a1[0]) / n0 * 80, a0[1] + (a0[1] - a1[1]) / n0 * 80]].concat(g, [[b0[0] + (b0[0] - b1[0]) / n1 * 80, b0[1] + (b0[1] - b1[1]) / n1 * 80]]);
+    const c = resample(g, 0.4), step = 0.5, pull = opt.pullComp * PPM;
+    const cand = [];
+    for (let i = 0; i < c.length; i++) {
+      const p = c[i], q0 = c[Math.max(0, i - 2)], q1 = c[Math.min(c.length - 1, i + 2)];
+      let tx = q1[0] - q0[0], ty = q1[1] - q0[1]; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+      const nx = -ty, ny = tx;
+      let start = null;
+      if (inside(p[0], p[1])) start = 0;
+      else for (let t = step; t <= 20; t += step) { if (inside(p[0] + nx * t, p[1] + ny * t)) { start = t; break; } if (inside(p[0] - nx * t, p[1] - ny * t)) { start = -t; break; } }
+      if (start === null) continue;
+      let tp = start, tm = start;
+      while (tp < start + 120 && inside(p[0] + nx * (tp + step), p[1] + ny * (tp + step))) tp += step;
+      while (tm > start - 120 && inside(p[0] + nx * (tm - step), p[1] + ny * (tm - step))) tm -= step;
+      if (tp - tm < 1.5) continue;
+      const A = [p[0] + nx * (tm - step / 2 - pull), p[1] + ny * (tm - step / 2 - pull)], B = [p[0] + nx * (tp + step / 2 + pull), p[1] + ny * (tp + step / 2 + pull)];
+      if (cand.length) {
+        const pa = cand[cand.length - 1];
+        if (Math.hypot((A[0] + B[0]) / 2 - (pa[0][0] + pa[1][0]) / 2, (A[1] + B[1]) / 2 - (pa[0][1] + pa[1][1]) / 2) > 12) continue;
+      }
+      cand.push([A, B]);
+    }
+    const sp = opt.satinSpacing * PPM, secs = [];
+    for (const s of cand) {
+      if (!secs.length) { secs.push(s); continue; }
+      const p = secs[secs.length - 1];
+      if (Math.max(dist(s[0], p[0]), dist(s[1], p[1])) >= sp) secs.push(s);
+    }
+    // coverage check
+    const cov = new Uint8Array(w * h);
+    for (const [A, B] of secs) { const L = dist(A, B); for (let t = 0; t <= L; t += 0.7) { const x = A[0] + (B[0] - A[0]) * t / L, y = A[1] + (B[1] - A[1]) * t / L; for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const xi = Math.floor(x + dx), yi = Math.floor(y + dy); if (xi >= 0 && yi >= 0 && xi < w && yi < h) cov[yi * w + xi] = 1; } } }
+    let tot = 0, hit = 0; for (let i = 0; i < w * h; i++) if (m[i]) { tot++; if (cov[i]) hit++; }
+    const maxW = opt.satinMaxMm * PPM, pts = [];
+    secs.forEach(([A, B], i) => {
+      const [P, Q] = i % 2 === 0 ? [A, B] : [B, A], W = dist(A, B), ns = Math.ceil(W / maxW);
+      if (ns <= 1) pts.push(P);
+      else for (let k = 0; k < ns; k++) { const f = k / ns + (i % 4 >= 2 ? 0.25 / ns : 0); pts.push([P[0] + (Q[0] - P[0]) * f, P[1] + (Q[1] - P[1]) * f]); }
+    });
+    return { pts, coverage: tot ? hit / tot : 0 };
+  }
+
+  // tatami rows over a raster shape (local px). Returns list of serpentine runs.
+  function tatamiRaster(m, w, h, angleDeg, spacingPx, Lpx, ext, minSeg) {
+    const inside = (x, y) => { const xi = Math.floor(x), yi = Math.floor(y); return xi >= 0 && yi >= 0 && xi < w && yi < h && m[yi * w + xi] === 1; };
+    const a = angleDeg * Math.PI / 180, ux = Math.cos(a), uy = Math.sin(a), vx = -uy, vy = ux;
+    const cs = [[0, 0], [w, 0], [0, h], [w, h]];
+    const us = cs.map(p => p[0] * ux + p[1] * uy), vs = cs.map(p => p[0] * vx + p[1] * vy);
+    const umin = Math.min(...us), umax = Math.max(...us), vmin = Math.min(...vs), vmax = Math.max(...vs);
+    const rows = [];
+    for (let v = vmin + spacingPx / 2; v < vmax; v += spacingPx) {
+      const segs = []; let inRun = false, t0 = 0;
+      for (let t = umin; t <= umax + 0.5; t += 0.5) {
+        const ins = t <= umax && inside(ux * t + vx * v, uy * t + vy * v);
+        if (ins && !inRun) { inRun = true; t0 = t; } else if (!ins && inRun) { inRun = false; segs.push([t0 - 0.25 - ext, t - 0.25 + ext]); }
+      }
+      rows.push({ v, segs: segs.filter(s => s[1] - s[0] > minSeg) });
+    }
+    const used = rows.map(r => r.segs.map(() => false)), groups = [];
+    for (let ri = 0; ri < rows.length; ri++) for (let si = 0; si < rows[ri].segs.length; si++) {
+      if (used[ri][si]) continue;
+      const grp = [[ri, si]]; used[ri][si] = true; let cur = rows[ri].segs[si], r = ri;
+      while (r + 1 < rows.length) {
+        let best = -1, bo = 0;
+        rows[r + 1].segs.forEach((sg, j) => { if (used[r + 1][j]) return; const ov = Math.min(cur[1], sg[1]) - Math.max(cur[0], sg[0]); if (ov > bo) { bo = ov; best = j; } });
+        if (best < 0) break;
+        r++; used[r][best] = true; cur = rows[r].segs[best]; grp.push([r, best]);
+      }
+      groups.push(grp);
+    }
+    const P = (t, v) => [ux * t + vx * v, uy * t + vy * v];
+    return groups.map(grp => {
+      const pts = [];
+      grp.forEach(([ri, si], k) => {
+        const [x0, x1] = rows[ri].segs[si], v = rows[ri].v, off = (ri % 3) * Lpx / 3, xs = [x0];
+        for (let kk = Math.ceil((x0 - off) / Lpx); off + kk * Lpx < x1; kk++) { const x = off + kk * Lpx; if (x > x0 + 6 && x < x1 - 6) xs.push(x); }
+        xs.push(x1);
+        if (k % 2) xs.reverse();
+        for (const x of xs) pts.push(P(x, v));
+      });
+      return pts;
+    });
+  }
+
+  // ------------------------------------------------------------------ stitch objects
+  const TRIM = 'TRIM';
+  class Seq {
+    constructor(pts, reversible) { this.pts = pts; this.rev = reversible !== false; }
+    first(e) { return this.emit(e)[0]; }
+    emit(e) { if (!e || !this.rev) return this.pts; return dist(this.pts[this.pts.length - 1], e) < dist(this.pts[0], e) ? this.pts.slice().reverse() : this.pts; }
+  }
+  class Choice {
+    constructor(opts) { this.opts = opts.filter(o => o.pts.length); }
+    pick(e) { if (!e) return this.opts[0]; return this.opts.reduce((b, o) => dist(o.first(e), e) < dist(b.first(e), e) ? o : b); }
+    first(e) { return this.pick(e).first(e); }
+    emit(e) { return this.pick(e).emit(e); }
+  }
+  class Group { // parts in nearest-neighbour order, travelling inside the colour where possible
+    constructor(parts, cover) { this.parts = parts.filter(p => p); this.cover = cover; }
+    nearest(parts, e) { if (!e) return 0; let k = 0, bd = BIG; parts.forEach((p, i) => { const d = dist(p.first(e), e); if (d < bd) { bd = d; k = i; } }); return k; }
+    first(e) { return this.parts.length ? this.parts[this.nearest(this.parts, e)].first(e) : null; }
+    emit(e) {
+      const parts = this.parts.slice(), out = []; let cur = e;
+      while (parts.length) {
+        const seg = parts.splice(this.nearest(parts, cur), 1)[0].emit(cur);
+        if (!seg.length) continue;
+        if (out.length) out.push(...connect(cur, seg[0], this.cover));
+        out.push(...seg); cur = seg[seg.length - 1];
+      }
+      return out;
+    }
+  }
+  class Chain { // fixed order of sub-objects (underlay before fill)
+    constructor(items, cover) { this.items = items.filter(i => i && i.parts ? i.parts.length : i); this.cover = cover; }
+    first(e) { return this.items[0].first(e); }
+    emit(e) {
+      const out = []; let cur = e;
+      for (const it of this.items) { const seg = it.emit(cur); if (!seg.length) continue; if (out.length) out.push(...connect(cur, seg[0], this.cover)); out.push(...seg); cur = seg[seg.length - 1]; }
+      return out;
+    }
+  }
+  function connect(p, q, cover) {
+    if (!p) return [];
+    const d = dist(p, q);
+    if (d < 0.9) return [];
+    if (cover) {
+      let ok = true; const n = Math.ceil(d / 0.05);
+      for (let i = 1; i < n && ok; i++) ok = cover(p[0] + (q[0] - p[0]) * i / n, p[1] + (q[1] - p[1]) * i / n);
+      if (ok) return run([p, q], 2.4).slice(1, -1);
+    }
+    return [TRIM];
+  }
+  function orderBlock(objs, cover, entry) {
+    objs = objs.slice(); const out = []; let cur = entry;
+    while (objs.length) {
+      let k = 0;
+      if (cur) { let bd = BIG; objs.forEach((o, i) => { const f = o.first(cur); const d = f ? dist(f, cur) : BIG; if (d < bd) { bd = d; k = i; } }); }
+      const seg = objs.splice(k, 1)[0].emit(cur);
+      if (!seg.length) continue;
+      if (out.length) out.push(...connect(cur, seg[0], cover));
+      out.push(...seg); cur = seg[seg.length - 1];
+    }
+    return { seq: out, cur };
+  }
+
+  // ------------------------------------------------------------------ regions -> objects
+  function splitBranches(lm, opt, minPx) {
+    const { m, w, h } = lm;
+    let total = 0; for (let i = 0; i < w * h; i++) total += m[i];
+    if (opt.splitMm <= 0 || total < 4 * minPx) return [lm];
+    const r = opt.splitMm * PPM / 2;
+    const toBg = edt(w, h, i => !m[i]);
+    const core = new Uint8Array(w * h); for (let i = 0; i < w * h; i++) core[i] = m[i] && toBg[i] > r * r ? 1 : 0;
+    const toCore = edt(w, h, i => core[i] === 1);
+    const body = new Uint8Array(w * h); let bsum = 0;
+    for (let i = 0; i < w * h; i++) { body[i] = m[i] && toCore[i] <= r * r ? 1 : 0; bsum += body[i]; }
+    if (bsum < 0.1 * total || bsum > 0.97 * total) return [lm];
+    const branch = new Uint8Array(w * h); for (let i = 0; i < w * h; i++) branch[i] = m[i] && !body[i] ? 1 : 0;
+    const pieces = [];
+    for (const c of components(branch, w, h, 1)) {
+      const loc = localMask(c, w), d = edt(loc.w, loc.h, i => !loc.m[i]);
+      let mx = 0; for (let i = 0; i < d.length; i++) if (d[i] > mx) mx = d[i];
+      const thick = 2 * Math.sqrt(mx);
+      if (c.pix.length >= minPx && c.pix.length / Math.max(thick, 1) ** 2 >= 3) pieces.push({ m: loc.m, w: loc.w, h: loc.h, ox: lm.ox + loc.ox, oy: lm.oy + loc.oy });
+      else for (const p of c.pix) body[p] = 1;
+    }
+    for (const c of components(body, w, h, minPx)) { const loc = localMask(c, w); pieces.push({ m: loc.m, w: loc.w, h: loc.h, ox: lm.ox + loc.ox, oy: lm.oy + loc.oy }); }
+    return pieces;
+  }
+
+  function pieceObject(pc, opt, cover) {
+    const { m, w, h, ox, oy } = pc;
+    const toMM = p => [(p[0] + ox) / PPM, (p[1] + oy) / PPM];
+    const d2 = edt(w, h, i => !m[i]);
+    let mx = 0, area = 0; for (let i = 0; i < w * h; i++) { if (d2[i] > mx && m[i]) mx = d2[i]; area += m[i]; }
+    const thick = 2 * Math.sqrt(mx) / PPM;
+    const info = { area: area / (PPM * PPM), kind: 'fill' };
+    if (thick < opt.thinMm) {
+      info.kind = 'line';
+      const sk = thin(m, w, h);
+      const parts = skeletonPaths(sk, w, h, 4).map(p => new Seq(bean(smoothPath(p, 5).map(toMM), 1.5)));
+      return { obj: parts.length ? new Group(parts, cover) : null, info };
+    }
+    if (thick <= opt.satinMaxMm * 2.5) {
+      const sk = thin(m, w, h);
+      const sw = []; for (let i = 0; i < w * h; i++) if (sk[i]) sw.push(2 * Math.sqrt(d2[i]) / PPM);
+      sw.sort((a, b) => a - b);
+      const p90 = sw.length ? sw[Math.floor(sw.length * 0.9)] : thick;
+      if (p90 <= opt.satinMaxMm) {
+        const lp = longestPath(sk, w, h);
+        if (lp && lp.path.length > 8 && lp.path.length >= 0.7 * lp.count) {
+          const spine = smoothPath(lp.path, 9);
+          const sat = satinRaster(m, w, h, spine, opt);
+          if (sat.pts.length > 4 && sat.coverage > 0.9) {
+            info.kind = 'satin';
+            const pts = sat.pts.map(toMM), sp = spine.map(toMM);
+            const ul = sp.length > 6 ? run(sp.slice(2, -2), 2.0) : [];
+            const mk = (u, s) => u.length ? new Seq(u.concat(run([u[u.length - 1], s[0]], 2.5).slice(1, -1), s), false) : new Seq(s, false);
+            return { obj: new Choice([mk(ul, pts.slice().reverse()), mk(ul.slice().reverse(), pts)]), info };
+          }
+        }
+      }
+    }
+    const angle = opt.fillAngle !== null && opt.fillAngle !== undefined ? opt.fillAngle : principalAngle(m, w, h) + 60;
+    const runs = tatamiRaster(m, w, h, angle, opt.fillSpacing * PPM, 30, opt.pullComp * PPM, 3).filter(r => r.length > 1).map(r => new Seq(r.map(toMM)));
+    if (!runs.length) return { obj: null, info };
+    const items = [];
+    if (info.area > 6) {
+      const ul = tatamiRaster(m, w, h, angle + 90, 18, 30, -4, 8).map(r => new Seq(r.map(toMM)));
+      if (ul.length) items.push(new Group(ul, cover));
+    }
+    items.push(new Group(runs, cover));
+    return { obj: new Chain(items, cover), info };
+  }
+
+  // ------------------------------------------------------------------ main
+  function digitize(rgba, srcW, srcH, options, progress) {
+    const opt = Object.assign({}, DEFAULTS, options || {});
+    const say = progress || (() => {});
+    let img = fromRGBA(rgba, srcW, srcH);
+    if (opt.crop) img = crop(img, ...opt.crop);
+    if (img.w < 8 || img.h < 8) throw new Error('The selected area is too small');
+
+    if (opt.autoTrim && !opt.keepBackground) {
+      say('Finding the design', 5);
+      const s = Math.min(1, 300 / Math.max(img.w, img.h));
+      let small = resize(img, Math.max(8, Math.round(img.w * s)), Math.max(8, Math.round(img.h * s)));
+      if (opt.photo) small = blur(small, 1.0);
+      const lab = toLab(small), km = kmeans(lab, small.w * small.h, opt.colors, 3);
+      const L = majority(km.labels, small.w, small.h, opt.colors, 1, 1);
+      const bg = backgroundLabel(L, small.w, small.h, opt.colors);
+      const fg = new Uint8Array(small.w * small.h); for (let i = 0; i < fg.length; i++) fg[i] = L[i] !== bg ? 1 : 0;
+      const comps = components(fg, small.w, small.h, Math.max(4, 0.002 * fg.length));
+      if (comps.length) {
+        let x0 = Math.min(...comps.map(c => c.x0)), y0 = Math.min(...comps.map(c => c.y0)), x1 = Math.max(...comps.map(c => c.x1)) + 1, y1 = Math.max(...comps.map(c => c.y1)) + 1;
+        const pad = 0.02 * Math.max(x1 - x0, y1 - y0);
+        const box = [(x0 - pad) / s, (y0 - pad) / s, (x1 + pad) / s, (y1 + pad) / s];
+        if (box[2] - box[0] > 20 && box[3] - box[1] > 20) img = crop(img, ...box);
+      }
+    }
+
+    say('Scaling', 12);
+    const W = Math.round(opt.widthMm * PPM), H = Math.round(img.h * (W / img.w) * opt.stretchY);
+    if (W * H > 9e6) throw new Error('Design too large - reduce the width');
+    img = resize(img, W, H);
+    if (opt.photo) { say('Smoothing photo', 18); img = smoothPhoto(img); }
+
+    say('Finding thread colours', 35);
+    const lab = toLab(img), k = Math.max(2, Math.min(16, opt.colors | 0));
+    const km = kmeans(lab, W * H, k, 1);
+    let labels = majority(km.labels, W, H, k, 2, 2);
+    const minPx = opt.minAreaMm2 * PPM * PPM;
+    labels = cleanSpecks(labels, W, H, k, minPx);
+    const bg = backgroundLabel(labels, W, H, k);
+    const colorsRGB = opt.photo ? representativeColors(lab, labels, W, H, k)
+      : Array.from({ length: k }, (_, c) => labToRgb(km.centers[c * 3], km.centers[c * 3 + 1], km.centers[c * 3 + 2]));
+
+    say('Tracing shapes', 50);
+    const byColor = new Map();
+    for (let c = 0; c < k; c++) {
+      if (c === bg && !opt.keepBackground) continue;
+      const cover = (x, y) => {
+        const xi = Math.floor(x * PPM), yi = Math.floor(y * PPM);
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const xx = xi + dx, yy = yi + dy; if (xx >= 0 && yy >= 0 && xx < W && yy < H && labels[yy * W + xx] === c) return true; }
+        return false;
+      };
+      const mask = new Uint8Array(W * H); for (let i = 0; i < W * H; i++) mask[i] = labels[i] === c ? 1 : 0;
+      const objs = [], infos = [];
+      for (const comp of components(mask, W, H, minPx)) {
+        const lm = localMask(comp, W);
+        for (const pc of splitBranches(lm, opt, minPx)) {
+          const r = pieceObject(pc, opt, cover);
+          if (r.obj) { objs.push(r.obj); infos.push(r.info); }
+        }
+      }
+      if (objs.length) byColor.set(c, { objs, infos, cover });
+    }
+    if (!byColor.size) throw new Error('No stitchable shapes found - try more colours or keep the background');
+
+    say('Ordering stitches', 80);
+    const order = [...byColor.keys()].sort((a, b) => {
+      const ka = byColor.get(a).infos, kb = byColor.get(b).infos;
+      const area = l => l.reduce((s, i) => s + i.area, 0), lineFrac = l => l.filter(i => i.kind === 'line').reduce((s, i) => s + i.area, 0) / area(l);
+      const la = lineFrac(ka) > 0.6, lb = lineFrac(kb) > 0.6;
+      return la !== lb ? (la ? 1 : -1) : area(kb) - area(ka);
+    });
+    const blocks = []; let cur = null;
+    for (const c of order) {
+      const { objs, cover } = byColor.get(c);
+      const r = orderBlock(objs, cover, cur);
+      if (r.seq.length) { blocks.push({ c, seq: r.seq }); cur = r.cur; }
+    }
+
+    // threads
+    const src = blocks.map(b => colorsRGB[b.c]);
+    const threads = opt.janome ? snapToJanome(src, opt.photo)
+      : src.map((rgb, i) => { const s = snapToJanome([rgb], opt.photo)[0]; return { index: s.index, rgb: rgb.map(Math.round), name: 'Colour ' + (i + 1) + ' (~' + s.name + ')' }; });
+
+    // runs, centring, lock stitches, long-stitch safety
+    let minx = BIG, miny = BIG, maxx = -BIG, maxy = -BIG;
+    for (const b of blocks) for (const p of b.seq) if (p !== TRIM) { minx = Math.min(minx, p[0]); maxx = Math.max(maxx, p[0]); miny = Math.min(miny, p[1]); maxy = Math.max(maxy, p[1]); }
+    const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
+    const tie = (a, b) => { const d = dist(a, b); if (d < 1e-6) return []; const ux = (b[0] - a[0]) / d * 0.35, uy = (b[1] - a[1]) / d * 0.35; return [[a[0] + ux, a[1] + uy], a, [a[0] + ux, a[1] + uy], a]; };
+    let stitchCount = 0;
+    const outBlocks = blocks.map((b, bi) => {
+      const runs = []; let curr = [];
+      for (const p of b.seq) { if (p === TRIM) { if (curr.length) runs.push(curr); curr = []; } else curr.push([p[0] - cx, p[1] - cy]); }
+      if (curr.length) runs.push(curr);
+      const finalRuns = runs.filter(r => r.length > 1).map(r => {
+        const body = [r[0]].concat(tie(r[0], r[1]), r.slice(1), tie(r[r.length - 1], r[r.length - 2]));
+        const out = [body[0]];
+        for (let i = 1; i < body.length; i++) {
+          const a = out[out.length - 1], q = body[i], d = dist(a, q);
+          if (d > MAX_STITCH) { const ns = Math.ceil(d / MAX_STITCH); for (let t = 1; t < ns; t++) out.push([a[0] + (q[0] - a[0]) * t / ns, a[1] + (q[1] - a[1]) * t / ns]); }
+          out.push(q);
+        }
+        stitchCount += out.length;
+        return out;
+      });
+      return { thread: threads[bi], runs: finalRuns };
+    });
+    const kinds = {};
+    for (const v of byColor.values()) for (const i of v.infos) kinds[i.kind] = (kinds[i.kind] || 0) + 1;
+    say('Done', 100);
+    return {
+      blocks: outBlocks,
+      info: {
+        sizeMm: [+(maxx - minx).toFixed(1), +(maxy - miny).toFixed(1)], stitches: stitchCount, shapes: kinds,
+        trims: outBlocks.reduce((s, b) => s + b.runs.length, 0),
+        pictureColors: src.map(labToRgbHex),
+        background: labToRgbHex(colorsRGB[bg])
+      }
+    };
+  }
+  function labToRgbHex(rgb) { return '#' + rgb.map(v => Math.round(v).toString(16).padStart(2, '0')).join(''); }
+
+  // ------------------------------------------------------------------ JEF writer
+  function writeJEF(pattern, date) {
+    const units = pattern.blocks.map(b => ({ idx: b.thread.index, runs: b.runs.map(r => r.map(p => [Math.round(p[0] * 10), Math.round(p[1] * 10)])) }));
+    const bytes = []; let points = 1; // END
+    let x = 0, y = 0, minx = 0, miny = 0, maxx = 0, maxy = 0;
+    const s8 = v => (v < 0 ? v + 256 : v) & 255;
+    const track = (X, Y) => { minx = Math.min(minx, X); maxx = Math.max(maxx, X); miny = Math.min(miny, Y); maxy = Math.max(maxy, Y); };
+    const move = (X, Y) => {
+      while (x !== X || y !== Y) {
+        const dx = Math.max(-127, Math.min(127, X - x)), dy = Math.max(-127, Math.min(127, Y - y));
+        bytes.push(0x80, 0x02, s8(dx), s8(-dy)); x += dx; y += dy; points += 2;
+      }
+    };
+    units.forEach((u, bi) => {
+      if (bi > 0) { bytes.push(0x80, 0x01, 0, 0); points += 2; }
+      u.runs.forEach((r, ri) => {
+        move(r[0][0], r[0][1]); track(x, y);
+        for (let i = 1; i < r.length; i++) {
+          const dx = r[i][0] - x, dy = r[i][1] - y;
+          if (Math.abs(dx) > 127 || Math.abs(dy) > 127) { move(r[i][0], r[i][1]); continue; }
+          bytes.push(s8(dx), s8(-dy)); x += dx; y += dy; points += 1; track(x, y);
+        }
+        bytes.push(0x80, 0x02, 0, 0, 0x80, 0x02, 0, 0, 0x80, 0x02, 0, 0); points += 6; // trim
+      });
+    });
+    bytes.push(0x80, 0x10);
+    const cc = units.length, dw = maxx - minx, dh = maxy - miny;
+    const hoop = (dw < 500 && dh < 500) ? 1 : (dw < 1260 && dh < 1100) ? 3 : (dw < 1400 && dh < 2000) ? 2 : (dw < 2000 && dh < 2000) ? 4 : 0;
+    const hw = Math.round(dw / 2), hh = Math.round(dh / 2);
+    const head = [];
+    const i32 = v => { head.push(v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255); };
+    i32(0x74 + cc * 8); i32(0x14);
+    const d = date || new Date(), pad2 = n => String(n).padStart(2, '0');
+    const ds = '' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+    for (const ch of ds) head.push(ch.charCodeAt(0));
+    head.push(0, 0);
+    i32(cc); i32(points); i32(hoop); i32(hw); i32(hh); i32(hw); i32(hh);
+    for (const [ex, ey] of [[550, 550], [250, 250], [700, 1000], [700, 1000]]) {
+      const a = ex - hw, b = ey - hh;
+      if (Math.min(a, b) >= 0) { i32(a); i32(b); i32(a); i32(b); } else { i32(-1); i32(-1); i32(-1); i32(-1); }
+    }
+    for (const u of units) i32(u.idx);
+    for (let i = 0; i < cc; i++) i32(0x0D);
+    const out = new Uint8Array(head.length + bytes.length);
+    out.set(head, 0); out.set(bytes, head.length);
+    return out;
+  }
+
+  // ------------------------------------------------------------------ preview (browser canvas)
+  function drawPreview(ctx, pattern, opts) {
+    const o = Object.assign({ fabric: '#e2a628', scale: 8, pad: 24 }, opts || {});
+    let minx = BIG, miny = BIG, maxx = -BIG, maxy = -BIG;
+    for (const b of pattern.blocks) for (const r of b.runs) for (const p of r) { minx = Math.min(minx, p[0]); maxx = Math.max(maxx, p[0]); miny = Math.min(miny, p[1]); maxy = Math.max(maxy, p[1]); }
+    const W = Math.ceil((maxx - minx) * o.scale + 2 * o.pad), H = Math.ceil((maxy - miny) * o.scale + 2 * o.pad);
+    ctx.canvas.width = W; ctx.canvas.height = H;
+    ctx.fillStyle = o.fabric; ctx.fillRect(0, 0, W, H);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const X = p => (p[0] - minx) * o.scale + o.pad, Y = p => (p[1] - miny) * o.scale + o.pad;
+    for (const b of pattern.blocks) {
+      const [r, g, bl] = b.thread.rgb;
+      for (const pass of [0, 1, 2]) {
+        ctx.strokeStyle = pass === 0 ? `rgba(${r * 0.45 | 0},${g * 0.45 | 0},${bl * 0.45 | 0},0.9)` : pass === 1 ? `rgb(${r},${g},${bl})` : `rgba(255,255,255,0.18)`;
+        ctx.lineWidth = o.scale * (pass === 0 ? 0.5 : pass === 1 ? 0.36 : 0.12);
+        const off = pass === 2 ? -o.scale * 0.06 : 0;
+        ctx.beginPath();
+        for (const run of b.runs) { ctx.moveTo(X(run[0]) + off, Y(run[0]) + off); for (let i = 1; i < run.length; i++) ctx.lineTo(X(run[i]) + off, Y(run[i]) + off); }
+        ctx.stroke();
+      }
+    }
+    return { width: W, height: H };
+  }
+
+  const api = { digitize, writeJEF, drawPreview, snapToJanome, DEFAULTS, PPM, JANOME };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.JefCore = api;
+})(typeof self !== 'undefined' ? self : this);
